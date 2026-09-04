@@ -131,6 +131,26 @@ jobs:
           # uninstall so the IPC-driven install proves it re-installs via Tophat
           xcrun simctl uninstall "$SIM_UDID" com.attacker.tophat.poc || true
 
+      - name: Build tophatctl from vendor source using xcodebuild -target
+        id: build_tophatctl
+        continue-on-error: true
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/Shopify/tophat.git tophat-src
+          cd tophat-src
+          xcodebuild -project Tophat.xcodeproj -target tophatctl -configuration Release \
+            -derivedDataPath /tmp/tophat_dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" 2>&1 | tail -25
+          TOPHATCTL=$(find /tmp/tophat_dd -type f -name "tophatctl" -perm +111 | head -1)
+          echo "TOPHATCTL=$TOPHATCTL" >> $GITHUB_ENV
+          test -n "$TOPHATCTL" && ls -la "$TOPHATCTL"
+
+      - name: Also check if Tophat.app.zip embeds tophatctl
+        continue-on-error: true
+        run: |
+          set -eux
+          find "$APP/../.." -maxdepth 6 -name "tophatctl" -type f 2>/dev/null || true
+
       - name: DIAGNOSTIC - test if DistributedNotificationCenter even delivers on this runner
         run: |
           set -eux
@@ -191,6 +211,44 @@ jobs:
             --style=syslog > tophat_stream.log 2>&1 &
           echo "LOG_STREAM_PID=$!" >> $GITHUB_ENV
           sleep 2
+
+      - name: DIAGNOSTIC 2 - post minimal ListDevicesRequest (id-only) to test Tophat receiver
+        continue-on-error: true
+        run: |
+          set -eux
+          cat > diag2.swift <<'SWIFT'
+          import Foundation
+          class Recv: NSObject {
+              var got = false
+              @objc func handle(_ note: Notification) {
+                  got = true
+                  print("[diag2] REPLY RECEIVED userInfo=\(note.userInfo ?? [:])")
+              }
+          }
+          let recv = Recv()
+          DistributedNotificationCenter.default().addObserver(
+              recv, selector: #selector(Recv.handle(_:)),
+              name: Notification.Name("Tophat.ListDevicesRequest.Reply"),
+              object: nil
+          )
+          DispatchQueue.global().async {
+              for i in 0..<8 {
+                  let uuid = UUID().uuidString
+                  DistributedNotificationCenter.default().postNotificationName(
+                      Notification.Name("Tophat.ListDevicesRequest"),
+                      object: nil,
+                      userInfo: ["id": uuid],
+                      deliverImmediately: true
+                  )
+                  print("[diag2 iter=\(i)] posted ListDevicesRequest id=\(uuid)")
+                  Thread.sleep(forTimeInterval: 3)
+                  if recv.got { break }
+              }
+          }
+          RunLoop.main.run(until: Date().addingTimeInterval(30))
+          print("[diag2] final got=\(recv.got)")
+          SWIFT
+          swift diag2.swift
 
       - name: Vector 1 - post InstallFromRecipesRequest with shell provider (retry loop)
         run: |
