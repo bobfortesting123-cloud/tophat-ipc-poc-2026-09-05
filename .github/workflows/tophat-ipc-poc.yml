@@ -20,13 +20,21 @@ jobs:
           xcrun simctl list runtimes | head -20 || true
 
       - name: Download latest Tophat release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
-          curl -sSL https://api.github.com/repos/Shopify/tophat/releases/latest > release.json
-          ASSET_URL=$(jq -r '.assets[] | select(.name | test("(?i)\\.(zip|dmg)$")) | .browser_download_url' release.json | head -1)
+          # /releases is more reliable than /latest against transient rate-limit weirdness
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Shopify/tophat/releases > releases.json
+          echo "releases count: $(jq 'length' releases.json)"
+          jq -r '.[0] | {tag: .tag_name, prerelease, assets: [.assets[].name]}' releases.json
+          ASSET_URL=$(jq -r '.[0].assets[] | select(.name | test("(?i)\\.(zip|dmg)$")) | .browser_download_url' releases.json | head -1)
           echo "asset: $ASSET_URL"
+          test -n "$ASSET_URL"
           curl -sSL -o tophat_release "$ASSET_URL"
           file tophat_release
+          ls -lh tophat_release
 
       - name: Extract Tophat.app
         run: |
