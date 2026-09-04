@@ -205,10 +205,10 @@ jobs:
           done
           ps -o pid,command -p $(pgrep -x Tophat) | head -3 || true
 
-      - name: Start Tophat unified log stream in background
+      - name: Start Tophat unified log stream in background (subsystem-scoped, debug level)
         run: |
-          nohup log stream --predicate 'process == "Tophat"' --level=debug \
-            --style=syslog > tophat_stream.log 2>&1 &
+          nohup log stream --predicate 'subsystem == "com.shopify.Tophat" OR process == "Tophat"' \
+            --level=debug --info --debug --style=syslog > tophat_stream.log 2>&1 &
           echo "LOG_STREAM_PID=$!" >> $GITHUB_ENV
           sleep 2
 
@@ -373,13 +373,14 @@ jobs:
             xcrun simctl listapps "$SIM_UDID" 2>/dev/null | head -30
           fi
 
-      - name: Dump Tophat unified log
+      - name: Dump Tophat unified log (subsystem-scoped)
         if: always()
         run: |
-          echo "===== TOPHAT UNIFIED LOG (post-run) ====="
-          log show --predicate 'process == "Tophat"' --last 10m --style=syslog 2>&1 | tee tophat_log.txt || true
-          echo "===== KEY LINES ====="
-          grep -iE 'ArtifactDownloader|InstallFrom|shell|artifactSource|installCoordinator|Application Scripts' tophat_log.txt tophat_stream.log 2>/dev/null | head -80 || true
+          echo "===== TOPHAT SUBSYSTEM LOG ====="
+          log show --predicate 'subsystem == "com.shopify.Tophat" OR process == "Tophat"' \
+            --last 15m --info --debug --style=syslog 2>&1 | tee tophat_log.txt || true
+          echo "===== KEY LINES (Tophat's own log.* calls) ====="
+          grep -iE '\[com\.shopify\.Tophat|ArtifactDownloader|InstallFrom|Application Scripts|Shell|Install' tophat_log.txt tophat_stream.log 2>/dev/null | grep -v "^[^:]*: (\(UserNotifications\|libxpc\|FrontBoard\|CoreFoundation\|CoreData\|CoreAnalytics\|SkyLight\|LaunchServices\|libMobile\|BoardServices\|RunningBoard\|AppKit\|AppIntents\|HIServices\)" | head -100 || true
 
       - name: Upload artifacts
         if: always()
