@@ -264,7 +264,8 @@ jobs:
                       "artifactProviderID": "shell",
                       "artifactProviderParameters": ["script": "x.sh"],
                       "launchArguments": [],
-                      "platformHint": "iOS"
+                      "platformHint": "ios",
+                  "destinationHint": "simulator"
                   ]]
               ]
               DistributedNotificationCenter.default().postNotificationName(
@@ -325,7 +326,8 @@ jobs:
                       "artifactProviderID": "shell",
                       "artifactProviderParameters": ["script": "x.sh"],
                       "launchArguments": [],
-                      "platformHint": "iOS"
+                      "platformHint": "ios",
+                  "destinationHint": "simulator"
                   ]]
               ]
           ]
